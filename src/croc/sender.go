@@ -414,6 +414,43 @@ func (cr *Croc) send(forceSend int, serverAddress string, tcpPorts []string, isL
 				log.Debug("connected and ready to send on tcp")
 				var wg sync.WaitGroup
 				wg.Add(len(tcpConnections))
+				stopReading := make(chan bool)
+				doneReading := make(chan bool)
+				gotError := make(chan error)
+				go func() {
+					// listen for errors
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Println("Recovered in f", r)
+						}
+						c.SetReadDeadline(time.Now().Add(3 * time.Hour))
+					}()
+					for {
+						c.SetReadDeadline(time.Now().Add(1000 * time.Millisecond))
+						_, message, err := c.ReadMessage()
+						if err == nil {
+							log.Debugf("got message while sending: '%s'", message)
+							if bytes.HasPrefix(message, []byte("error")) {
+								for i := 0; i < len(tcpConnections); i++ {
+									gotError <- fmt.Errorf("%s", message)
+								}
+								doneReading <- true
+								return
+							}
+						} else {
+							log.Debug(err)
+						}
+						select {
+						case _ = <-stopReading:
+							doneReading <- true
+							return
+						default:
+							time.Sleep(1 * time.Second)
+							continue
+						}
+					}
+				}()
+				var recipientError error
 				for i := range tcpConnections {
 					defer func(i int) {
 						log.Debugf("closing connection %d", i)
@@ -438,16 +475,27 @@ func (cr *Croc) send(forceSend int, serverAddress string, tcpPorts []string, isL
 								log.Debugf("%d got magic", i)
 								return
 							}
+							select {
+							case recipientError = <-gotError:
+								return
+							default:
+								continue
+							}
 						}
 					}(i, &wg, dataChan)
 				}
 				wg.Wait()
+				_ = <-doneReading
+				if recipientError != nil {
+					return recipientError
+				}
 			}
 
 			cr.Bar.Finish()
 			log.Debug("send hash to finish file")
 			fileHash, err = utils.HashFile(fname)
 			if err != nil {
+				log.Debug(err)
 				return err
 			}
 		case 6:
